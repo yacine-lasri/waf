@@ -1,0 +1,13 @@
+# Ignore build outputs
+*.o
+*.exe
+*.out
+
+# Python files from earlier prototyping
+__pycache__/
+*.pyc
+
+# Editor files
+.vscode/
+*.swp
+*~
