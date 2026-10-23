@@ -1,7 +1,18 @@
-# Ignore build outputs
+# Compiled binaries (no extension on Linux)
+step01_server
+step02_backend
+step02_proxy
+step03_http_parser
+step04_waf_rules
+step05_waf_complete
+
+# Build artifacts
 *.o
 *.exe
 *.out
+
+# Runtime logs
+waf_log.txt
 
 # Python files from earlier prototyping
 __pycache__/
@@ -11,3 +22,7 @@ __pycache__/
 .vscode/
 *.swp
 *~
+
+# OS files
+.DS_Store
+Thumbs.db
