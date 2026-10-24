@@ -1,8 +1,8 @@
 # 🛡️ WAF — Web Application Firewall in C
 
-A production-style Web Application Firewall built from scratch in C, step by step. This project demonstrates network programming, HTTP parsing, and defense-in-depth web application security — evolving from a basic TCP socket to a resilient firewall capable of defeating real-world attack evasions.
+A hardened learning-stage Web Application Firewall built in C, step by step. Developed as an interactive systems programming project pair-programmed with Google Antigravity (Advanced Agentic AI Coding Assistant), following [Beej's Guide to Network Programming](https://beej.us/guide/bgnet/).
 
-Built following [Beej's Guide to Network Programming](https://beej.us/guide/bgnet/).
+This project explores POSIX network programming, HTTP/1.1 parsing, and defense-in-depth web application security — evolving from a raw TCP socket to a reverse-proxy firewall that handles common evasions, protocol edge cases, and stream buffering.
 
 ---
 
@@ -13,11 +13,13 @@ Built following [Beej's Guide to Network Programming](https://beej.us/guide/bgne
                     │            WAF (port 8080)             │
                     │                                        │
   Client ─────────► │  1. Buffered TCP Multi-Read Loop       │
-  (browser/curl)    │     - Read timeout (3s slow-client DoS)│
+  (browser/curl)    │     - Monotonic per-request deadline   │
+                    │       (3s cap defends slowloris)       │
                     │     - Full header & body accumulation  │
                     │                                        │
                     │  2. Protocol & Smuggling Validation    │
-                    │     - Reject conflicting Content-Length│
+                    │     - Reject conflicting CL.CL / CL.TE │
+                    │     - Reject unhandled chunked bodies  │
                     │     - Enforce URI limits (< 4096B)     │
                     │                                        │
                     │  3. Multi-Round Canonicalization       │
@@ -37,7 +39,7 @@ Built following [Beej's Guide to Network Programming](https://beej.us/guide/bgne
                     └────────────────────────────────────────┘
 ```
 
-The WAF operates as a reverse proxy sitting inline between client traffic and the origin web application. It intercepts every TCP segment, normalizes and decodes input streams, evaluates threats across all protocol surfaces, and drops malicious payloads before they reach the server.
+The WAF operates as a reverse proxy sitting inline between client traffic and the origin web application. It intercepts incoming TCP streams, normalizes and decodes input buffers, evaluates threat signatures across HTTP protocol surfaces, and drops malicious payloads before they can reach the server.
 
 ---
 
@@ -49,7 +51,7 @@ The WAF operates as a reverse proxy sitting inline between client traffic and th
 | **02** | `step02_backend.c`<br>`step02_proxy.c` | **Reverse Proxying**: Infinite accept loops, outbound `connect()`, dual-socket forwarding and relaying. |
 | **03** | `step03_http_parser.c` | **HTTP/1.1 Dissection**: Boundary parsing via `\r\n` and `\r\n\r\n`, extracting method, path, headers, and body. |
 | **04** | `step04_waf_rules.c` | **Signature Rule Engine**: Pattern matching for SQLi, XSS, Path Traversal, and Command Injection with custom 403 error pages. |
-| **05** | `step05_waf_complete.c` | **Complete Hardened WAF**: Multi-read stream buffering, URL & double-decoding canonicalization, SQL comment de-obfuscation, header surface auditing, request smuggling defense, URI size validation, rate limiting, and persistent audit logging. |
+| **05** | `step05_waf_complete.c` | **Complete Hardened WAF**: Multi-read stream buffering, dynamic Slowloris deadline (`clock_gettime`), URL & double-decoding canonicalization, SQL comment de-obfuscation, header surface auditing, request smuggling & chunked TE guards, URI size validation, rate limiting, and persistent audit logging. |
 
 ---
 
@@ -77,8 +79,9 @@ The WAF operates as a reverse proxy sitting inline between client traffic and th
 - **Subshells & Substitution**: `` `cmd` ``, `$(cmd)`
 - **Reverse Shell & Downloaders**: `; nc`, `; curl`, `; wget`, `/bin/sh`, `/bin/bash`
 
-### 5. HTTP Protocol Integrity & Smuggling Defense
-- **Conflicting Headers**: Drops requests with duplicate, conflicting `Content-Length` headers (`400 Bad Request`) to prevent desynchronization / request smuggling.
+### 5. HTTP Protocol Integrity & Focused Smuggling Defense
+- **Conflicting Headers (CL.CL / CL.TE)**: Rejects requests with duplicate `Content-Length` headers or conflicting `Content-Length` + `Transfer-Encoding` (`400 Bad Request`) to prevent request smuggling desynchronization.
+- **Unhandled Chunked TE Guard**: Explicitly rejects `Transfer-Encoding: chunked` (`400 Bad Request`) because without implementing a full streaming chunk de-framer, chunked payloads cannot be inspected and would otherwise bypass body inspection.
 - **URI Length Enforcement**: Enforces a strict 4096-byte URI limit, responding with `414 URI Too Long` to prevent buffer exhaustion and evasion by padding.
 
 ### 6. Per-IP Rate Limiting
@@ -87,23 +90,24 @@ The WAF operates as a reverse proxy sitting inline between client traffic and th
 
 ---
 
-## 🛡️ Evasion Defenses & Stream Hardening
+## 🛡️ Evasion Defenses & Iterative Bug Fixes
 
-During comprehensive testing, naive signature WAFs fail against obfuscation. SentinelNet includes dedicated mitigation layers:
+During development and testing, naive signature matching proved fragile against common obfuscation techniques. The table below documents specific bugs discovered across development iterations and the mitigations implemented in `step05_waf_complete.c`:
 
-| Attack Vector | Evasion Technique | Vulnerability in Basic WAFs | SentinelNet Mitigation |
+| Attack Vector | Evasion Technique | Observed in Step 04 / Early Code | WAF Step 05 Fix |
 |:---|:---|:---|:---|
-| **Percent Encoding** | `union%20select` | Looked for literal `' '` (0x20); bypassed by `%20`. | In-flight **`url_decode()` pass** converts hex encodings before pattern matching. |
-| **Double Encoding** | `%2527 OR 1=1` | `%2527` decoded once becomes `%27`, bypassing single-pass decoders. | **Multi-round decoding pipeline** checks raw, single-decoded, and double-decoded variants. |
-| **SQL Comment Inlining** | `UN/**/ION SEL/**/ECT` | `/**/` splits keywords or acts as non-space whitespace. | **`strip_sql_comments()` engine** strips block comments to both empty string and whitespace variants. |
-| **Header Injections** | `User-Agent: ' OR 1=1--` | WAF only inspected URI and Body; ignored headers. | Deep surface auditing across **`User-Agent`**, **`Referer`**, **`Cookie`**, and **`Host`**. |
-| **Split TCP Headers** | `GET / HTTP` ...pause... `/1.1` | Single `recv()` returned partial segment; dropped as malformed. | **Multi-read streaming loop** buffers input until header delimiter `\r\n\r\n` arrives. |
-| **Delayed POST Body** | Headers sent, body delayed 1s | Single `recv()` captured headers only; body bypassed inspection. | Content-Length aware buffering reads until **`body_bytes >= Content-Length`** before rule evaluation. |
-| **Slow Client Starvation**| Client connects and sends nothing | Single-threaded server blocked indefinitely in `recv()`. | **`SO_RCVTIMEO` socket timeout (3s)** frees connection if client goes idle. |
+| **Percent Encoding** | `union%20select` | **Found in Step 04**: Looked for literal `' '` (0x20); bypassed completely by `%20`. | In-flight **`url_decode()` pass** converts hex encodings before pattern matching. |
+| **Double Encoding** | `%2527 OR 1=1` | **Found in early Step 05**: A single-pass decode turned `%2527` into `%27`, bypassing checks. | **Multi-round decoding pipeline** checks raw, single-decoded, and double-decoded variants. |
+| **SQL Comment Inlining** | `UN/**/ION SEL/**/ECT` | **Found in Step 04**: Block comments `/**/` broke keyword matching and acted as whitespace. | **`strip_sql_comments()` engine** strips block comments to both empty string and whitespace variants. |
+| **Header Injections** | `User-Agent: ' OR 1=1--` | **Found in Step 04**: WAF only inspected URI query and body; completely ignored headers. | Deep surface auditing across **`User-Agent`**, **`Referer`**, **`Cookie`**, and **`Host`**. |
+| **Split TCP Headers** | `GET / HTTP` ...pause... `/1.1` | **Found in Step 03/04**: Single `recv()` captured only the first segment; dropped as malformed. | **Multi-read streaming loop** buffers input until header delimiter `\r\n\r\n` arrives. |
+| **Delayed POST Body** | Headers sent, body delayed 1s | **Found in Step 03/04**: Single `recv()` captured headers only; body bypassed inspection. | Content-Length aware buffering reads until **`body_bytes >= Content-Length`** before rule evaluation. |
+| **Slowloris Drip-Feed** | 1 byte sent every 1.5s | **Found in early Step 05**: `SO_RCVTIMEO` reset per `recv()`, allowing slow clients to hold server indefinitely. | **Absolute per-request deadline** via `clock_gettime(CLOCK_MONOTONIC)` with dynamic `SO_RCVTIMEO` budget recalculation (3.0s total cap). |
+| **Chunked TE Smuggling** | `Transfer-Encoding: chunked` | **Found in early Step 05**: Requests lacking `Content-Length` bypassed body checks. | **Smuggling & bypass guard**: Rejects conflicting TE/CL headers and unsupported chunked streams (`400 Bad Request`). |
 
 ---
 
-## 🧪 Master Test Suite (40/40 Passing)
+## 🧪 Master Regression Test Suite (40/40 Passing)
 
 The project includes an automated test suite (`test_waf.sh`) covering 40 deterministic security and robustness scenarios:
 
@@ -188,6 +192,39 @@ bash test_waf.sh
 
 ---
 
+## 🔬 Beyond Regression: Edge Cases & Tradeoff Probes (`test_edge_cases.sh`)
+
+A test suite where all 40 tests pass is a regression suite, not proof of total security. Real security systems are defined by their edge cases and architectural tradeoffs. 
+
+The standalone script `test_edge_cases.sh` specifically probes boundary conditions:
+
+```bash
+bash test_edge_cases.sh
+```
+
+```
+=================================================================
+          Testing Potential Bypasses & Edge Cases                
+=================================================================
+
+--- 1. Slowloris Drip-Feed (Per-Call Timeout vs Total Deadline) ---
+  [RESILIENT] Concurrent client succeeded in 2s (Code: 200)
+
+--- 2. Chunked Transfer-Encoding (TE.CL / Blind Bypass Guard) ---
+  [REJECTED] Chunked Transfer-Encoding rejected by WAF (Got: HTTP/1.1 400 Bad Request)
+
+--- 3. Unicode / Non-Standard %uXXXX Hex Encoding ---
+  [BYPASS / LIMITATION] %u0075 passed through (Got: 200) — requires %u decoder
+
+--- 4. JSON Body with \uXXXX Escape ---
+  [BYPASS / LIMITATION] JSON \u escape passed through (Got: 200) — requires JSON parser
+
+--- 5. Single Traversal in Query Parameter ---
+  [BYPASS / TRADEOFF] ../admin/config.php passed through (Got: 200) — FP tuning tradeoff
+```
+
+---
+
 ## ⚡ Quick Start
 
 ### 1. Build
@@ -205,6 +242,9 @@ make all
 
 # Terminal 3: Run Test Suite
 bash test_waf.sh
+
+# Terminal 4: Run Edge Case Probes
+bash test_edge_cases.sh
 ```
 
 ---
@@ -214,12 +254,12 @@ bash test_waf.sh
 All requests, outcomes, and detection rules are written in real-time to `waf_log.txt`:
 
 ```
-[2026-10-24 00:18:44] 127.0.0.1 GET / ALLOWED
-[2026-10-24 00:18:44] 127.0.0.1 GET /login?user=admin'%20OR%201=1-- BLOCKED (SQL Injection: OR 1=1-- [in Query String])
-[2026-10-24 00:18:45] 127.0.0.1 POST /submit BLOCKED (SQL Injection: UNION SELECT [in Body])
-[2026-10-24 00:18:45] 127.0.0.1 GET / BLOCKED (SQL Injection: OR 1=1-- [in User-Agent Header])
-[2026-10-24 00:18:46] 127.0.0.1 POST / BLOCKED (Conflicting Content-Length headers)
-[2026-10-24 00:18:47] 127.0.0.1 GET /ping_101 RATE-LIMITED
+[2026-10-24 10:55:26] 127.0.0.1 GET / ALLOWED
+[2026-10-24 10:55:26] 127.0.0.1 GET /login?user=admin'%20OR%201=1-- BLOCKED (SQL Injection: OR 1=1 [in Query String])
+[2026-10-24 10:55:27] 127.0.0.1 POST /ping BLOCKED (Path Traversal: /etc/passwd [in Body])
+[2026-10-24 10:55:27] 127.0.0.1 GET /?q=UniOn%20SeLeCt%20*%20FROM%20users BLOCKED (SQL Injection: UNION SELECT [in Query String])
+[2026-10-24 10:55:28] 127.0.0.1 POST / BLOCKED (Conflicting headers (Request Smuggling guard))
+[2026-10-24 10:55:31] 127.0.0.1 GET /ping_101 RATE-LIMITED
 ```
 
 ---
@@ -228,18 +268,31 @@ All requests, outcomes, and detection rules are written in real-time to `waf_log
 
 Understanding what a security system *cannot* do is as important as understanding what it can. For technical discussions and systems interviews:
 
-1. **Single-Threaded Blocking Accept Loop vs. Event-Driven Concurrency (`epoll`)**:
-   - *Current Implementation*: Uses standard blocking `accept()` with socket read timeouts (`SO_RCVTIMEO`).
-   - *Limitation*: While the 3-second timeout prevents permanent starvation, concurrent throughput is serialized. A production WAF requires an asynchronous event loop (`epoll` / `kqueue` / `io_uring`) or a multi-threaded worker pool.
-2. **Signature Matching vs. Semantic AST Analysis (e.g. Libinjection)**:
-   - *Current Implementation*: Normalizes input via URL decoding and comment-stripping, then executes case-insensitive substring searches.
-   - *Limitation*: Highly sophisticated SQL dialects (e.g., esoteric concatenation, mathematical boolean transforms like `' OR 2>1`) can theoretically evade regexes. Production engines (ModSecurity, Cloudflare WAF) combine regex CRS with SQL/HTML lexical tokenizers.
-3. **Fixed Window vs. Token Bucket Rate Limiting**:
-   - *Current Implementation*: Fixed 60-second window reset per IP.
-   - *Limitation*: A client can consume their limit at second 59 and consume another full quota at second 61 (2x burst). A Token Bucket or Leaky Bucket algorithm provides smoother traffic shaping.
-4. **TLS / HTTPS Termination**:
-   - *Current Implementation*: Plaintext HTTP/1.1 proxy.
-   - *Limitation*: Inspecting encrypted HTTPS requires integrating an SSL/TLS layer (such as OpenSSL or mbedTLS) or deploying behind an upstream TLS terminator (HAProxy, Nginx, AWS ALB).
+### 1. Slow-Client Defense: `SO_RCVTIMEO` vs Monotonic Total Deadline
+- **The Pitfall**: `SO_RCVTIMEO` specifies an inactivity timeout *per individual `recv()` system call*, not a total deadline for the entire request. A Slowloris client trickling 1 byte every 1.5 seconds continuously resets the timer, starving a single-threaded server indefinitely.
+- **The Fix**: In `step05_waf_complete.c`, we track request start time via `clock_gettime(CLOCK_MONOTONIC)` with `#define TOTAL_REQUEST_DEADLINE 3.0`. On every iteration of the `recv()` loop, `SO_RCVTIMEO` is dynamically recalculated to `TOTAL_REQUEST_DEADLINE - elapsed`. If the budget is exhausted, the connection is terminated.
+- **Remaining Limitation**: While this prevents indefinite starvation, concurrent connections are still serialized during that 3-second window. A production WAF requires an asynchronous event loop (`epoll` / `io_uring`) or a multi-threaded worker pool.
+
+### 2. Chunked Transfer-Encoding & Request Smuggling Boundaries
+- **Narrow Guard**: The WAF detects conflicting `Content-Length` headers and conflicting `Transfer-Encoding` + `Content-Length` pairs (`400 Bad Request`). It also explicitly rejects unhandled `Transfer-Encoding: chunked` requests (`400 Bad Request`).
+- **Limitation**: The WAF does not implement a full streaming RFC 7230 chunked de-framer. Rather than forwarding uninspected chunked data (which would allow an attacker to bypass inspection or desynchronize downstream reverse proxies), the WAF rejects chunked encoding entirely. A production WAF must decode chunked streams in real-time, inspect the assembled buffer, and re-chunk or serialize with `Content-Length`.
+
+### 3. Path Traversal False-Positive Tuning Tradeoff
+- **The Tradeoff**: In `step04_waf_rules.c`, blocking any occurrence of `../` broke legitimate relative asset URLs (e.g., `?bg=../images/logo.png`). To reduce false positives, `step05_waf_complete.c` permits a single `../` in query parameters unless it targets known system files (`/etc/passwd`, `/etc/shadow`, `/proc/self`, `c:\windows`, `win.ini`).
+- **The Resulting Bypass**: As demonstrated in `test_edge_cases.sh` Test 5, an attacker requesting `?page=../admin/config.php` will pass through unblocked. Without application-level route knowledge or backend chroot sandboxing, heuristic path traversal filtering faces an unavoidable tension between false positives and exploit coverage.
+
+### 4. Encoding Boundaries: Non-Standard `%uXXXX` & JSON `\uXXXX`
+- **Limitation**: The canonicalization pipeline handles standard URL percent-encoding (`%XX` with two hex digits) and SQL comment stripping. It does not parse non-standard Microsoft IIS-style `%uXXXX` encodings (`%u0075%u006e...` for `union`) or JSON string escape sequences (`\u0075\u006e\u0069\u006f\u006e`).
+- **Impact**: As demonstrated in `test_edge_cases.sh` Tests 3 & 4, if a backend framework (such as IIS/ASP.NET or a JSON REST API parser) decodes these sequences prior to SQL query execution, the payload bypasses the WAF's string-matching engine. Production WAFs require content-type aware tokenizers (e.g., a native JSON parser).
+
+### 5. Signature Matching vs Semantic AST Analysis (e.g. Libinjection)
+- **Limitation**: The engine relies on case-insensitive substring search after normalization. Sophisticated SQL dialect constructs (e.g., esoteric concatenation, mathematical boolean transforms like `' OR 2>1`) can theoretically evade static signatures. Production engines (ModSecurity, Cloudflare WAF) combine regex rules with SQL/HTML lexical tokenizers.
+
+### 6. Fixed Window vs Token Bucket Rate Limiting
+- **Limitation**: The rate limiter tracks request counts in fixed 60-second windows per IP. A client could exhaust their quota at second 59 and immediately consume a second full quota at second 61 (a 2x burst). A Token Bucket or Leaky Bucket algorithm provides smoother traffic shaping.
+
+### 7. Plaintext HTTP vs TLS/HTTPS Termination
+- **Limitation**: The WAF functions exclusively as a plaintext HTTP/1.1 proxy. Inspecting encrypted HTTPS traffic requires either embedding an SSL library (OpenSSL / mbedTLS) or deploying the WAF behind an upstream TLS terminator (HAProxy, Nginx, or AWS ALB).
 
 ---
 

@@ -44,6 +44,7 @@
 #define MAX_PATH_LEN    4096          /* Max allowed URI length               */
 #define LOG_FILE        "waf_log.txt" /* Request audit log path               */
 #define CLIENT_TIMEOUT  3             /* Socket read timeout in seconds       */
+#define TOTAL_REQUEST_DEADLINE 3.0    /* Maximum total request lifetime (s)   */
 
 /* --- Rate Limiting Configuration --- */
 #define MAX_TRACKED_IPS 256
@@ -296,6 +297,18 @@ static int parse_http_request(const char *raw, int raw_len, struct http_request 
             while (*h && *h != '\r' && *h != '\n' && i < (int)sizeof(req->host) - 1)
                 req->host[i++] = *h++;
             req->host[i] = '\0';
+        }
+    }
+
+    /* Check for Transfer-Encoding header & Smuggling detection (CL.TE / TE.CL) */
+    {
+        const char *te = case_insensitive_strstr(header_start, "Transfer-Encoding:");
+        if (te) {
+            const char *cl = case_insensitive_strstr(header_start, "Content-Length:");
+            if (cl) {
+                return -3; /* Conflicting Transfer-Encoding & Content-Length: Smuggling rejected */
+            }
+            return -4; /* Chunked Transfer-Encoding rejected to prevent blind body bypass */
         }
     }
 
@@ -966,14 +979,29 @@ static void handle_client(int client_fd, const char *client_ip)
     const char *threat;
     int parse_res;
 
-    /* Set socket read timeout to prevent slow-client starvation */
-    struct timeval tv;
-    tv.tv_sec = CLIENT_TIMEOUT;
-    tv.tv_usec = 0;
-    setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    /* Track total request start time for overall deadline (Slowloris defense) */
+    struct timespec start_ts, now_ts;
+    clock_gettime(CLOCK_MONOTONIC, &start_ts);
 
     /* --- Multi-read loop: buffer entire headers + body --- */
     while (total_received < BUFFER_SIZE - 1) {
+        /* Enforce absolute per-request deadline across all reads */
+        clock_gettime(CLOCK_MONOTONIC, &now_ts);
+        double elapsed = (double)(now_ts.tv_sec - start_ts.tv_sec) +
+                         (double)(now_ts.tv_nsec - start_ts.tv_nsec) / 1e9;
+        double remaining = TOTAL_REQUEST_DEADLINE - elapsed;
+        if (remaining <= 0.05) {
+            /* Total per-request deadline expired: Slowloris drip-feed neutralized */
+            break;
+        }
+
+        /* Dynamically update SO_RCVTIMEO to remaining budget */
+        struct timeval tv;
+        tv.tv_sec = (time_t)remaining;
+        tv.tv_usec = (suseconds_t)((remaining - tv.tv_sec) * 1000000.0);
+        if (tv.tv_sec == 0 && tv.tv_usec < 10000) tv.tv_usec = 10000;
+        setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
         int n = recv(client_fd, buffer + total_received, BUFFER_SIZE - 1 - total_received, 0);
         if (n <= 0) break;
         total_received += n;
@@ -1023,9 +1051,19 @@ static void handle_client(int client_fd, const char *client_ip)
     }
 
     if (parse_res == -3) {
-        /* 400 Bad Request: Conflicting Content-Length (Smuggling vector) */
-        log_request(client_ip, "POST", "/", "BLOCKED", "Conflicting Content-Length headers");
-        send_400_bad_request(client_fd, "Conflicting Content-Length headers detected");
+        /* 400 Bad Request: Conflicting Content-Length or CL.TE / TE.CL Smuggling */
+        log_request(client_ip, "POST", "/", "BLOCKED", "Conflicting headers (Request Smuggling guard)");
+        send_400_bad_request(client_fd, "Conflicting Content-Length or Transfer-Encoding headers detected");
+        stats.blocked_requests++;
+        stats.total_requests++;
+        close(client_fd);
+        return;
+    }
+
+    if (parse_res == -4) {
+        /* 400 Bad Request: Transfer-Encoding chunked unsupported */
+        log_request(client_ip, "POST", "/", "BLOCKED", "Chunked Transfer-Encoding rejected (Bypass guard)");
+        send_400_bad_request(client_fd, "Transfer-Encoding: chunked not supported for inspection");
         stats.blocked_requests++;
         stats.total_requests++;
         close(client_fd);
