@@ -14,7 +14,7 @@ This project explores POSIX network programming, HTTP/1.1 parsing, and defense-i
                     │                                        │
   Client ─────────► │  1. Buffered TCP Multi-Read Loop       │
   (browser/curl)    │     - Monotonic per-request deadline   │
-                    │       (3s cap defends slowloris)       │
+                    │       (3s cap bounds slow connection)  │
                     │     - Full header & body accumulation  │
                     │                                        │
                     │  2. Protocol & Smuggling Validation    │
@@ -32,7 +32,7 @@ This project explores POSIX network programming, HTTP/1.1 parsing, and defense-i
                     │     - POST / PUT body data             │
                     │     - User-Agent, Referer, Cookie, Host│
                     │                                        │
-                    │  5. Rate Limiting (Sliding Window)     │
+                    │  5. Rate Limiting (Fixed Window)       │
                     │                                        │
                     │  6a. BLOCK ──► 400 / 403 / 414 / 429   │
                     │  6b. ALLOW ──► Relay to Backend ───────┼──► Backend (port 8888)
@@ -51,7 +51,7 @@ The WAF operates as a reverse proxy sitting inline between client traffic and th
 | **02** | `step02_backend.c`<br>`step02_proxy.c` | **Reverse Proxying**: Infinite accept loops, outbound `connect()`, dual-socket forwarding and relaying. |
 | **03** | `step03_http_parser.c` | **HTTP/1.1 Dissection**: Boundary parsing via `\r\n` and `\r\n\r\n`, extracting method, path, headers, and body. |
 | **04** | `step04_waf_rules.c` | **Signature Rule Engine**: Pattern matching for SQLi, XSS, Path Traversal, and Command Injection with custom 403 error pages. |
-| **05** | `step05_waf_complete.c` | **Complete Hardened WAF**: Multi-read stream buffering, dynamic Slowloris deadline (`clock_gettime`), URL & double-decoding canonicalization, SQL comment de-obfuscation, header surface auditing, request smuggling & chunked TE guards, URI size validation, rate limiting, and persistent audit logging. |
+| **05** | `step05_waf_complete.c` | **Complete Hardened WAF**: Multi-read stream buffering, monotonic per-connection timeout cap (`clock_gettime`), URL & double-decoding canonicalization, SQL comment de-obfuscation, header surface auditing, request smuggling & chunked TE guards, URI size validation, rate limiting, and persistent audit logging. |
 
 ---
 
@@ -85,8 +85,8 @@ The WAF operates as a reverse proxy sitting inline between client traffic and th
 - **URI Length Enforcement**: Enforces a strict 4096-byte URI limit, responding with `414 URI Too Long` to prevent buffer exhaustion and evasion by padding.
 
 ### 6. Per-IP Rate Limiting
-- Evaluates request rates per client IP over a sliding 60-second window.
-- Drops excess traffic with `429 Too Many Requests` and sends a `Retry-After` header.
+- Evaluates request counts per client IP over a **fixed 60-second window** (`window_start` resets after 60s elapsed).
+- Drops excess traffic beyond the quota with `429 Too Many Requests` and sends a `Retry-After: 60` header.
 
 ---
 
@@ -102,7 +102,7 @@ During development and testing, naive signature matching proved fragile against 
 | **Header Injections** | `User-Agent: ' OR 1=1--` | **Found in Step 04**: WAF only inspected URI query and body; completely ignored headers. | Deep surface auditing across **`User-Agent`**, **`Referer`**, **`Cookie`**, and **`Host`**. |
 | **Split TCP Headers** | `GET / HTTP` ...pause... `/1.1` | **Found in Step 03/04**: Single `recv()` captured only the first segment; dropped as malformed. | **Multi-read streaming loop** buffers input until header delimiter `\r\n\r\n` arrives. |
 | **Delayed POST Body** | Headers sent, body delayed 1s | **Found in Step 03/04**: Single `recv()` captured headers only; body bypassed inspection. | Content-Length aware buffering reads until **`body_bytes >= Content-Length`** before rule evaluation. |
-| **Slowloris Drip-Feed** | 1 byte sent every 1.5s | **Found in early Step 05**: `SO_RCVTIMEO` reset per `recv()`, allowing slow clients to hold server indefinitely. | **Absolute per-request deadline** via `clock_gettime(CLOCK_MONOTONIC)` with dynamic `SO_RCVTIMEO` budget recalculation (3.0s total cap). |
+| **Slow Connection Drip-Feed** | 1 byte sent every 1.5s | **Found in early Step 05**: `SO_RCVTIMEO` reset per `recv()`, allowing a slow client to hold a single connection indefinitely. | **Monotonic per-request deadline** via `clock_gettime(CLOCK_MONOTONIC)` with dynamic `SO_RCVTIMEO` reduction bounds each connection to 3.0s (does not prevent connection-churn DoS on a single-threaded server). |
 | **Chunked TE Smuggling** | `Transfer-Encoding: chunked` | **Found in early Step 05**: Requests lacking `Content-Length` bypassed body checks. | **Smuggling & bypass guard**: Rejects conflicting TE/CL headers and unsupported chunked streams (`400 Bad Request`). |
 
 ---
@@ -268,10 +268,11 @@ All requests, outcomes, and detection rules are written in real-time to `waf_log
 
 Understanding what a security system *cannot* do is as important as understanding what it can. For technical discussions and systems interviews:
 
-### 1. Slow-Client Defense: `SO_RCVTIMEO` vs Monotonic Total Deadline
-- **The Pitfall**: `SO_RCVTIMEO` specifies an inactivity timeout *per individual `recv()` system call*, not a total deadline for the entire request. A Slowloris client trickling 1 byte every 1.5 seconds continuously resets the timer, starving a single-threaded server indefinitely.
+### 1. Slow-Client Timeout: `SO_RCVTIMEO` vs Monotonic Deadline (and Reconnection Churn)
+- **The Pitfall**: `SO_RCVTIMEO` specifies an inactivity timeout *per individual `recv()` system call*, not a total deadline for the entire request. A slow client trickling 1 byte every 1.5 seconds continuously resets the timer, starving a single-threaded server indefinitely.
 - **The Fix**: In `step05_waf_complete.c`, we track request start time via `clock_gettime(CLOCK_MONOTONIC)` with `#define TOTAL_REQUEST_DEADLINE 3.0`. On every iteration of the `recv()` loop, `SO_RCVTIMEO` is dynamically recalculated to `TOTAL_REQUEST_DEADLINE - elapsed`. If the budget is exhausted, the connection is terminated.
-- **Remaining Limitation**: While this prevents indefinite starvation, concurrent connections are still serialized during that 3-second window. A production WAF requires an asynchronous event loop (`epoll` / `io_uring`) or a multi-threaded worker pool.
+- **Why "Defends Slowloris" is an Overstatement (Reconnection Churn DoS)**: The 3.0-second deadline only bounds *each individual connection*. In our single-threaded accept loop, an attacker opening slow connections back to back in a tight loop (`while true; do trickle_slow; done`) can still keep the server busy nearly 100% of the time. Empirical testing confirms that concurrent requests experience multi-second latency spikes (or queue starvation) waiting for each slow connection to cycle out. True Slowloris immunity requires an asynchronous event loop (`epoll` / `io_uring`) with non-blocking I/O multiplexing.
+- **Real-World Cost for Legitimate Users on Slow Links**: A hard 3.0-second wall-clock deadline penalizes legitimate clients on slow or high-latency mobile networks. A 100 KB POST body over a degraded 2G/EDGE cellular link or congested network (upload speed < 33 KB/s) will be abruptly severed by the WAF before transfer finishes. Production proxies mitigate slowloris by monitoring minimum byte-transfer rates (e.g. Nginx `client_body_timeout` and minimum throughput thresholds) rather than static wall-clock deadlines.
 
 ### 2. Chunked Transfer-Encoding & Request Smuggling Boundaries
 - **Narrow Guard**: The WAF detects conflicting `Content-Length` headers and conflicting `Transfer-Encoding` + `Content-Length` pairs (`400 Bad Request`). It also explicitly rejects unhandled `Transfer-Encoding: chunked` requests (`400 Bad Request`).
